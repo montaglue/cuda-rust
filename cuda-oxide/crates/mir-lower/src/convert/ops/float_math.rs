@@ -1183,6 +1183,7 @@ mod tests {
                 allow_fma_contraction: false,
                 intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
                 module_disambiguator: None,
+                float_rem: crate::FloatRemLowering::LibdeviceFmod,
             },
         );
 
@@ -1533,6 +1534,7 @@ mod tests {
                 allow_fma_contraction: true,
                 intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
                 module_disambiguator: None,
+                float_rem: crate::FloatRemLowering::LibdeviceFmod,
             },
         );
         assert_eq!(
@@ -1582,6 +1584,7 @@ mod tests {
                 allow_fma_contraction: true,
                 intrinsic_backend: crate::IntrinsicBackend::LibNvvm,
                 module_disambiguator: None,
+                float_rem: crate::FloatRemLowering::LibdeviceFmod,
             },
         );
         assert_eq!(

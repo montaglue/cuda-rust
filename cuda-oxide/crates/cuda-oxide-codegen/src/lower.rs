@@ -46,6 +46,7 @@ pub fn lower_to_llvm(
             allow_fma_contraction,
             intrinsic_backend,
             module_disambiguator,
+            float_rem: mir_lower::FloatRemLowering::LibdeviceFmod,
         },
     ) {
         Ok(warnings) => Ok(warnings),

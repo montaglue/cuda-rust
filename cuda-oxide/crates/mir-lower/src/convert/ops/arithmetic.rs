@@ -14,7 +14,7 @@
 //! |---------------|-----------------------------------|----------------------------------------------|
 //! | Integer Arith | `add`, `sub`, `mul`, `div`, `rem` | `add`, `sub`, `mul`, `sdiv`/`udiv`, `srem`/`urem` |
 //! | Float Arith   | `add`, `sub`, `mul`, `div`        | `fadd`, `fsub`, `fmul`, `fdiv`               |
-//! | Float Rem     | `rem`                             | `call __nv_fmodf` / `call __nv_fmod`         |
+//! | Float Rem     | `rem`                             | `call __nv_fmodf` / `call __nv_fmod`, or `frem` |
 //! | Unary         | `neg`, `not`                      | `fneg` / `sub 0, x`, `xor`                   |
 //! | Bitwise       | `and`, `or`, `xor`, `not`         | `and`, `or`, `xor`                           |
 //! | Shifts        | `shl`, `shr`                      | `shl`, `lshr`/`ashr`                         |
@@ -31,7 +31,7 @@
 use crate::convert::intrinsics::common::call_intrinsic;
 use crate::convert::types::convert_type;
 use crate::convert::types::{StructLayoutInfo, build_struct_slot_map};
-use crate::helpers;
+use crate::{FloatRemLowering, context, helpers};
 use dialect_mir::types::MirTupleType;
 use llvm_export::attributes::{
     FCmpPredicateAttr, FastmathFlags, FastmathFlagsAttr, ICmpPredicateAttr,
@@ -247,8 +247,9 @@ pub(crate) fn convert_div(
     Ok(())
 }
 
-/// Convert `mir.rem` to `llvm.srem` (signed), `llvm.urem` (unsigned), or a
-/// libdevice `fmod` call (float).
+/// Convert `mir.rem` to `llvm.srem` (signed), `llvm.urem` (unsigned), or,
+/// for floats, a libdevice `fmod` call or `llvm.frem` (see
+/// [`FloatRemLowering`](crate::FloatRemLowering)).
 ///
 /// Uses pre-conversion MIR operand type signedness to select between signed
 /// and unsigned integer remainder.
@@ -280,7 +281,8 @@ pub const LIBDEVICE_FMOD_F64: &str = "__nv_fmod";
 /// libdevice entry point for `f32` remainder (also used for `f16` after widening).
 pub const LIBDEVICE_FMOD_F32: &str = "__nv_fmodf";
 
-/// Convert float `mir.rem` to a libdevice `fmod` call.
+/// Convert float `mir.rem` to a libdevice `fmod` call, or to `llvm.frem`
+/// when the lowering options ask for [`FloatRemLowering::LlvmFrem`].
 ///
 /// Rust float `%` is C `fmod`: exact for every finite operand pair, with
 /// the sign of the dividend. `llvm.frem` is not a usable lowering on NVPTX,
@@ -291,7 +293,8 @@ pub const LIBDEVICE_FMOD_F32: &str = "__nv_fmodf";
 ///
 /// `f16` has no libdevice entry. It widens to `f32`, where `fmod` of two
 /// `f16` values is still exact and its result is representable in `f16`,
-/// then narrows back.
+/// then narrows back. `llvm.frem` keeps the same widening, so both forms
+/// compute the remainder at the same width.
 fn convert_float_rem(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -320,37 +323,47 @@ fn convert_float_rem(
         (lhs, rhs)
     };
 
-    let func_ty = llvm_types::FuncType::get(ctx, call_ty, vec![call_ty, call_ty], false);
-    let parent_block = op
-        .deref(ctx)
-        .get_parent_block()
-        .ok_or_else(|| pliron::input_error!(loc.clone(), "float rem has no parent block"))?;
-    helpers::ensure_intrinsic_declared(ctx, parent_block, callee, func_ty)
-        .map_err(|e| pliron::input_error!(loc.clone(), "Failed to declare {callee}: {e}"))?;
-    let sym_name: pliron::identifier::Identifier = callee
-        .try_into()
-        .map_err(|e| pliron::input_error!(loc.clone(), "Invalid callee name: {:?}", e))?;
-    let call = llvm::CallOp::new(ctx, CallOpCallable::Direct(sym_name), func_ty, vec![a, b])
-        .get_operation();
-    rewriter.insert_operation(ctx, call);
+    let remainder = match context::lowering_options(ctx).float_rem {
+        FloatRemLowering::LibdeviceFmod => {
+            let func_ty = llvm_types::FuncType::get(ctx, call_ty, vec![call_ty, call_ty], false);
+            let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
+                pliron::input_error!(loc.clone(), "float rem has no parent block")
+            })?;
+            helpers::ensure_intrinsic_declared(ctx, parent_block, callee, func_ty).map_err(
+                |e| pliron::input_error!(loc.clone(), "Failed to declare {callee}: {e}"),
+            )?;
+            let sym_name: pliron::identifier::Identifier = callee
+                .try_into()
+                .map_err(|e| pliron::input_error!(loc.clone(), "Invalid callee name: {:?}", e))?;
+            llvm::CallOp::new(ctx, CallOpCallable::Direct(sym_name), func_ty, vec![a, b])
+                .get_operation()
+        }
+        FloatRemLowering::LlvmFrem => {
+            let frem = llvm::FRemOp::new(ctx, a, b).get_operation();
+            set_empty_fastmath_flags(ctx, frem);
+            frem
+        }
+    };
+    rewriter.insert_operation(ctx, remainder);
 
     let result = if widen {
-        let wide_result = call.deref(ctx).get_result(0);
+        let wide_result = remainder.deref(ctx).get_result(0);
         let narrow = llvm::FPTruncOp::new(ctx, wide_result, value_ty).get_operation();
         set_empty_fastmath_flags(ctx, narrow);
         rewriter.insert_operation(ctx, narrow);
         narrow
     } else {
-        call
+        remainder
     };
     rewriter.replace_operation(ctx, op, result);
     Ok(())
 }
 
-/// Attach empty fast-math flags to a float cast.
+/// Attach empty fast-math flags to a float cast or `frem`.
 ///
-/// The cast verifiers require the `llvm_fast_math_flags` attribute to be
-/// present; the widening around `fmod` must stay exact, so it is empty.
+/// Their verifiers require the `llvm_fast_math_flags` attribute to be
+/// present; the remainder and the widening around it must stay exact, so it
+/// is empty.
 fn set_empty_fastmath_flags(ctx: &mut Context, op: Ptr<Operation>) {
     let key: pliron::identifier::Identifier = "llvm_fast_math_flags".try_into().unwrap();
     op.deref_mut(ctx)
@@ -1082,6 +1095,7 @@ mod tests {
                 allow_fma_contraction: false,
                 intrinsic_backend: crate::IntrinsicBackend::LlvmNvptx,
                 module_disambiguator: None,
+                float_rem: crate::FloatRemLowering::LibdeviceFmod,
             },
         )
         .expect("lowering failed");

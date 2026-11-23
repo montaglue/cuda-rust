@@ -3335,3 +3335,94 @@ fn test_float_rem_lowers_to_libdevice_fmod() -> Result<(), anyhow::Error> {
     assert_eq!(urem, 1, "unsigned mir.rem must lower to llvm.urem");
     Ok(())
 }
+
+/// With `FloatRemLowering::LlvmFrem`, float `mir.rem` lowers to `llvm.frem`
+/// on each width and nothing declares libdevice. `f16` keeps the widening to
+/// `f32` around the remainder, as it does around the libdevice call.
+#[test]
+fn test_float_rem_lowers_to_llvm_frem_when_asked() -> Result<(), anyhow::Error> {
+    use dialect_mir::types::MirFP16Type;
+    use mir_lower::convert::ops::arithmetic::{LIBDEVICE_FMOD_F32, LIBDEVICE_FMOD_F64};
+    use pliron::builtin::types::{FP32Type, FP64Type};
+    use pliron::r#type::{TypeHandle, Typed};
+
+    let mut ctx = make_test_ctx();
+    let f16_ty: TypeHandle = MirFP16Type::get(&ctx).into();
+    let f32_ty: TypeHandle = FP32Type::get(&ctx).into();
+    let f64_ty: TypeHandle = FP64Type::get(&ctx).into();
+    let (module_ptr, entry) = build_test_kernel(
+        &mut ctx,
+        vec![f16_ty, f16_ty, f32_ty, f32_ty, f64_ty, f64_ty],
+    );
+    for (lhs, result_ty) in [(0, f16_ty), (2, f32_ty), (4, f64_ty)] {
+        let operands = vec![
+            entry.deref(&ctx).get_argument(lhs),
+            entry.deref(&ctx).get_argument(lhs + 1),
+        ];
+        let rem = Operation::new(
+            &mut ctx,
+            mir::MirRemOp::get_concrete_op_info(),
+            vec![result_ty],
+            operands,
+            vec![],
+            0,
+        );
+        rem.insert_at_back(entry, &ctx);
+    }
+    append_return(&mut ctx, entry);
+
+    mir_lower::lower_mir_to_llvm_with_options(
+        &mut ctx,
+        module_ptr,
+        mir_lower::LoweringOptions {
+            float_rem: mir_lower::FloatRemLowering::LlvmFrem,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let f32_llvm: TypeHandle = FP32Type::get(&ctx).into();
+    let f64_llvm: TypeHandle = FP64Type::get(&ctx).into();
+    let mut frem_tys = Vec::new();
+    let mut calls = 0usize;
+    let mut fpext = 0usize;
+    let mut fptrunc = 0usize;
+    for body_op in lowered_kernel_body(&ctx, module_ptr) {
+        if let Some(frem) = Operation::get_op::<llvm::FRemOp>(body_op, &ctx) {
+            frem_tys.push(
+                frem.get_operation()
+                    .deref(&ctx)
+                    .get_result(0)
+                    .get_type(&ctx),
+            );
+        }
+        calls += usize::from(Operation::get_op::<llvm::CallOp>(body_op, &ctx).is_some());
+        fpext += usize::from(Operation::get_op::<llvm::FPExtOp>(body_op, &ctx).is_some());
+        fptrunc += usize::from(Operation::get_op::<llvm::FPTruncOp>(body_op, &ctx).is_some());
+    }
+    assert_eq!(
+        frem_tys,
+        vec![f32_llvm, f32_llvm, f64_llvm],
+        "float mir.rem must lower to llvm.frem, f16 widened to f32"
+    );
+    assert_eq!(calls, 0, "no float mir.rem may call libdevice");
+    assert_eq!((fpext, fptrunc), (2, 1), "only the f16 remainder widens");
+
+    let module_block = module_ptr
+        .deref(&ctx)
+        .get_region(0)
+        .deref(&ctx)
+        .iter(&ctx)
+        .next()
+        .unwrap();
+    for op in module_block.deref(&ctx).iter(&ctx) {
+        if let Some(func) = Operation::get_op::<llvm::FuncOp>(op, &ctx) {
+            let name = func.get_symbol_name(&ctx).to_string();
+            assert!(
+                name != LIBDEVICE_FMOD_F32 && name != LIBDEVICE_FMOD_F64,
+                "{name} must not be declared"
+            );
+        }
+    }
+    Ok(())
+}

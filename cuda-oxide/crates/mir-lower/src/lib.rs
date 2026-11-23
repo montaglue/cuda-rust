@@ -175,6 +175,22 @@ pub enum IntrinsicBackend {
     LibNvvm,
 }
 
+/// How float `mir.rem` (Rust's float `%`) is lowered.
+///
+/// Rust float `%` is C `fmod`. LLVM's `frem` has the same semantics, but the
+/// NVPTX backend expands it inexactly, so device code calls libdevice
+/// instead. A caller that lowers for a target whose LLVM backend implements
+/// `frem` exactly (CPU backends call libm's `fmod`) and that has no
+/// libdevice can ask for `frem` itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FloatRemLowering {
+    /// Call libdevice's `__nv_fmodf` / `__nv_fmod`.
+    #[default]
+    LibdeviceFmod,
+    /// Emit `llvm.frem`.
+    LlvmFrem,
+}
+
 /// Options controlling the `dialect-mir` to LLVM dialect lowering pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoweringOptions {
@@ -203,6 +219,8 @@ pub struct LoweringOptions {
     /// `StableCrateId` hash. `None` leaves the family directly followed by
     /// its suffix (`__shared_mem_<hash>`), for output that is never merged.
     pub module_disambiguator: Option<u64>,
+    /// How float `mir.rem` is lowered.
+    pub float_rem: FloatRemLowering,
 }
 
 impl Default for LoweringOptions {
@@ -211,6 +229,7 @@ impl Default for LoweringOptions {
             allow_fma_contraction: true,
             intrinsic_backend: IntrinsicBackend::LlvmNvptx,
             module_disambiguator: None,
+            float_rem: FloatRemLowering::LibdeviceFmod,
         }
     }
 }
