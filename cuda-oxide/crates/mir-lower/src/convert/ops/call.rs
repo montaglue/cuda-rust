@@ -1364,6 +1364,11 @@ fn find_callee_arg_types(
     op: Ptr<Operation>,
     callee_ident: &pliron::identifier::Identifier,
 ) -> Option<Vec<TypeHandle>> {
+    // Recorded for every function of the module before conversion
+    // ([index_callee_arg_types]); a converted callee keeps those types.
+    if let Some(arg_types) = crate::context::callee_arg_types(ctx, callee_ident) {
+        return Some(arg_types.to_vec());
+    }
     let block = op.deref(ctx).get_parent_block()?;
     let func_op = block.deref(ctx).get_parent_op(ctx)?;
     let module_op = func_op.deref(ctx).get_parent_op(ctx)?;
@@ -1413,6 +1418,44 @@ fn find_callee_arg_types(
     }
 
     None
+}
+
+/// The parameter types `find_callee_arg_types` finds for each function of
+/// `module_op`, recorded in one pass before conversion: an `llvm.func`'s own,
+/// else a `mir.func`'s signature as `convert_function_type` projects it —
+/// what the function lowerer gives the callee, so the record stays right as
+/// conversion turns `mir.func`s into `llvm.func`s.
+pub(crate) fn index_callee_arg_types(
+    ctx: &mut Context,
+    module_op: Ptr<Operation>,
+) -> crate::context::CalleeArgTypes {
+    let mut callees = crate::context::CalleeArgTypes::default();
+    let region = module_op.deref(ctx).get_region(0);
+    let Some(module_block) = region.deref(ctx).iter(ctx).next() else {
+        return callees;
+    };
+    let ops: Vec<Ptr<Operation>> = module_block.deref(ctx).iter(ctx).collect();
+    let mut llvm_functions = Vec::new();
+    for existing_op in ops {
+        if let Some(function) = Operation::get_op::<llvm::FuncOp>(existing_op, ctx) {
+            llvm_functions.push(function);
+        } else if let Some(function) = MirFuncOp::wrap(ctx, existing_op) {
+            let name = function.get_symbol_name(ctx);
+            let mir_func_ty = function.get_type(ctx);
+            let callee_is_kernel = is_kernel_func(ctx, existing_op);
+            if let Ok(llvm_func_ty) = convert_function_type(ctx, mir_func_ty, callee_is_kernel) {
+                callees
+                    .0
+                    .insert(name, llvm_func_ty.deref(ctx).arg_types().clone());
+            }
+        }
+    }
+    // An `llvm.func` of the name takes precedence, as in the scan.
+    for function in llvm_functions {
+        let arg_types = function.get_type(ctx).deref(ctx).arg_types().clone();
+        callees.0.insert(function.get_symbol_name(ctx), arg_types);
+    }
+    callees
 }
 
 /// Resolve a device-extern symbol name by stripping the internal prefix.

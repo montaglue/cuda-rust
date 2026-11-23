@@ -49,6 +49,50 @@ pub(crate) fn lowering_options(ctx: &Context) -> LoweringOptions {
         .unwrap_or_default()
 }
 
+mod callee_storage {
+    pliron::dict_key!(
+        CALLEE_ARG_TYPES_KEY,
+        "cuda_oxide_mir_lower_callee_arg_types"
+    );
+}
+
+/// The LLVM parameter types of each function of the module being lowered,
+/// by symbol, as the call converter looks them up (`find_callee_arg_types`).
+/// Recorded once before conversion: a scan of the module per converted call
+/// makes lowering quadratic in the module's size.
+#[derive(Default)]
+pub(crate) struct CalleeArgTypes(pub(crate) FxHashMap<Identifier, Vec<TypeHandle>>);
+
+/// Record the callee parameter types for the active lowering; `None` forgets
+/// them (after conversion).
+pub(crate) fn set_callee_arg_types(ctx: &mut Context, callees: Option<CalleeArgTypes>) {
+    let callees = callees.unwrap_or_default();
+    if let Some(index) = ctx
+        .aux_data_map
+        .get(&callee_storage::CALLEE_ARG_TYPES_KEY)
+        .copied()
+    {
+        ctx.aux_data[index] = Box::new(callees);
+    } else {
+        let index = ctx.aux_data.insert(Box::new(callees));
+        ctx.aux_data_map
+            .insert(callee_storage::CALLEE_ARG_TYPES_KEY.clone(), index);
+    }
+}
+
+/// The recorded parameter types of `callee`, if the active lowering recorded
+/// it.
+pub(crate) fn callee_arg_types<'c>(
+    ctx: &'c Context,
+    callee: &Identifier,
+) -> Option<&'c [TypeHandle]> {
+    ctx.aux_data_map
+        .get(&callee_storage::CALLEE_ARG_TYPES_KEY)
+        .and_then(|index| ctx.aux_data[*index].downcast_ref::<CalleeArgTypes>())
+        .and_then(|callees| callees.0.get(callee))
+        .map(Vec::as_slice)
+}
+
 /// Name for one generated module-scope global of a lowering-owned family
 /// (`__shared_mem`, `__device_global`, `__dynamic_smem`).
 ///

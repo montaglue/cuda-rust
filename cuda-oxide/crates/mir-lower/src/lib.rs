@@ -430,9 +430,14 @@ pub fn lower_mir_to_llvm_with_options(
         dynamic_smem_alignments: FxHashMap::default(),
         next_shared_mem_index: 0,
     };
+    // Every call looks its callee's parameter types up: record them once.
+    let callees = convert::ops::call::index_callee_arg_types(ctx, module_op);
+    context::set_callee_arg_types(ctx, Some(callees));
     // pliron's DialectConversion now reports an IRStatus (Changed/Unchanged);
     // lowering only cares about success, so discard it.
-    apply_dialect_conversion(ctx, &mut conversion, module_op)?;
+    let converted = apply_dialect_conversion(ctx, &mut conversion, module_op);
+    context::set_callee_arg_types(ctx, None);
+    converted?;
     // Conversions of diverging ops (e.g. `nvvm.assertfail`) erase everything
     // after the noreturn call, including the block's terminator. A successor
     // whose only predecessor was that terminator is now unreachable, and if it

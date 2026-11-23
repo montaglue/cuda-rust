@@ -18,16 +18,19 @@ use pliron::{
     builtin::{
         attr_interfaces::TypedAttrInterface,
         attributes::{StringAttr, TypeAttr},
-        op_interfaces::SymbolOpInterface,
+        op_interfaces::{SymbolOpInterface, SymbolUserOpInterface},
         type_interfaces::FunctionTypeInterface,
         types::{FunctionType, IntegerType, Signedness},
     },
     common_traits::Verify,
     context::{Context, Ptr},
+    derive::op_interface_impl,
+    identifier::Identifier,
     linked_list::ContainsLinkedList,
     op::Op,
     operation::Operation,
     result::Error,
+    symbol_table::SymbolTableCollection,
     r#type::{TypeHandle, Typed, type_cast},
     verify_err,
 };
@@ -64,6 +67,9 @@ use pliron_derive::pliron_op;
 /// - Must have `callee` attribute.
 /// - Once the call and callee have both been attached to the same module,
 ///   operand and result types must match the callee's `mir.func` signature.
+///   The callee is resolved when the module (the enclosing symbol table) is
+///   verified ([SymbolUserOpInterface]): one symbol table for all of the
+///   module's calls, where a lookup per call would scan the module.
 /// - An attached foreign call with no `mir.func` must carry both an exact
 ///   `external_callee_type` and `AbiBoundary`; the call must match that type.
 /// - Internal Rust-intrinsic placeholders use exact, name-specific rules and
@@ -160,27 +166,11 @@ impl Verify for MirCallOp {
             );
         }
 
-        match resolve_call(ctx, self.get_operation(), &callee_name) {
-            CallResolution::AttachedResolved(callee) => {
-                if external_signature.is_some() {
-                    return verify_err!(
-                        op.loc(),
-                        "call to an in-module mir.func must not claim external ABI authority"
-                    );
-                }
-                verify_call_signature(ctx, self, callee.get_type(ctx).into())
-            }
-            CallResolution::AttachedUnresolved => {
-                let Some(signature) = external_signature else {
-                    return verify_err!(
-                        op.loc(),
-                        "attached MirCallOp `{}` has no in-module mir.func or independently typed foreign ABI signature",
-                        callee_name
-                    );
-                };
-                verify_call_signature(ctx, self, signature)
-            }
-            CallResolution::Detached => {
+        match call_symbol_block(ctx, self.get_operation()) {
+            // Resolved against the module's symbol table when the module is
+            // verified (`verify_symbol_uses`).
+            Some(_) => Ok(()),
+            None => {
                 // Importer functions are verified before they are inserted in
                 // the module, so ordinary symbol lookup genuinely is not
                 // possible yet. Still validate an explicit foreign claim now;
@@ -193,6 +183,86 @@ impl Verify for MirCallOp {
                 }
             }
         }
+    }
+}
+
+#[op_interface_impl]
+impl SymbolUserOpInterface for MirCallOp {
+    /// Resolve the callee in the nearest symbol table (the module) and check
+    /// the call against it: the signature of an in-module `mir.func`, or
+    /// else the call's own foreign ABI signature.
+    fn verify_symbol_uses(
+        &self,
+        ctx: &Context,
+        symbol_tables: &mut SymbolTableCollection,
+    ) -> Result<(), Error> {
+        let Some(callee_attr) = self.get_attr_callee(ctx) else {
+            // `verify` reports the missing callee.
+            return Ok(());
+        };
+        let callee_name = String::from((*callee_attr).clone());
+        // Placeholders are no symbols; `verify` checks them.
+        if callee_name.starts_with(rust_intrinsics::PLACEHOLDER_PREFIX)
+            || call_symbol_block(ctx, self.get_operation()).is_none()
+        {
+            return Ok(());
+        }
+        let op = self.get_operation();
+        let external_signature = external_callee_signature(ctx, self)?;
+        let callee = Identifier::try_from(callee_name.as_str())
+            .ok()
+            .and_then(|symbol| symbol_tables.lookup_symbol_in_nearest_table(ctx, op, &symbol))
+            .and_then(|symbol| super::MirFuncOp::wrap(ctx, symbol.get_operation()));
+        match callee {
+            Some(callee) => {
+                if external_signature.is_some() {
+                    return verify_err!(
+                        op.deref(ctx).loc(),
+                        "call to an in-module mir.func must not claim external ABI authority"
+                    );
+                }
+                verify_call_signature(ctx, self, callee.get_type(ctx).into())
+            }
+            None => {
+                let Some(signature) = external_signature else {
+                    return verify_err!(
+                        op.deref(ctx).loc(),
+                        "attached MirCallOp `{}` has no in-module mir.func or independently typed foreign ABI signature",
+                        callee_name
+                    );
+                };
+                verify_call_signature(ctx, self, signature)
+            }
+        }
+    }
+
+    fn used_symbols(&self, ctx: &Context) -> Vec<Identifier> {
+        self.get_attr_callee(ctx)
+            .and_then(|callee| Identifier::try_from(String::from((*callee).clone()).as_str()).ok())
+            .into_iter()
+            .collect()
+    }
+}
+
+/// The symbol block (a module's body) a call is placed in: the block holding
+/// its enclosing `mir.func`, or a module's block holding the call or its
+/// enclosing non-MIR function. `None` while the call is detached (the
+/// importer verifies functions before inserting them in their module).
+fn call_symbol_block(
+    ctx: &Context,
+    call: Ptr<Operation>,
+) -> Option<Ptr<pliron::basic_block::BasicBlock>> {
+    let mut containing_op = call;
+    loop {
+        let parent_block = containing_op.deref(ctx).get_parent_block()?;
+        let parent_op = parent_block.deref(ctx).get_parent_op(ctx)?;
+        if let Some(function) = super::MirFuncOp::wrap(ctx, parent_op) {
+            return function.get_operation().deref(ctx).get_parent_block();
+        }
+        if Operation::get_op::<pliron::builtin::ops::ModuleOp>(parent_op, ctx).is_some() {
+            return Some(parent_block);
+        }
+        containing_op = parent_op;
     }
 }
 
@@ -484,6 +554,13 @@ mod tests {
         (function, entry)
     }
 
+    /// Verify `call` as the module's verifier does: the call's own checks,
+    /// then its callee against the module's symbol table.
+    fn verify_call(ctx: &Context, call: &MirCallOp) -> Result<(), Error> {
+        call.verify(ctx)?;
+        call.verify_symbol_uses(ctx, &mut SymbolTableCollection::new())
+    }
+
     fn append_call(
         ctx: &mut Context,
         block: Ptr<BasicBlock>,
@@ -604,7 +681,7 @@ mod tests {
                 vec![],
             );
             assert!(
-                mismatched.verify(&ctx).is_err(),
+                verify_call(&ctx, &mismatched).is_err(),
                 "{actual_kind:?} (mutable={actual_mutable}) must not satisfy an in-module \
                  {expected_kind:?} (mutable={expected_mutable}) parameter"
             );
@@ -618,7 +695,7 @@ mod tests {
                 vec![],
             );
             assert!(
-                exact.verify(&ctx).is_ok(),
+                verify_call(&ctx, &exact).is_ok(),
                 "the exact {expected_kind:?} argument must verify"
             );
             append_return(&mut ctx, caller_entry);
@@ -651,7 +728,7 @@ mod tests {
         append_return(&mut ctx, caller_entry);
 
         assert!(
-            call.verify(&ctx).is_ok(),
+            verify_call(&ctx, &call).is_ok(),
             "a Rust unit call result is the documented empty-signature bridge"
         );
     }
@@ -663,7 +740,7 @@ mod tests {
 
         let detached = new_call(&mut ctx, "ordinary_function", vec![], vec![]);
         assert!(
-            detached.verify(&ctx).is_ok(),
+            verify_call(&ctx, &detached).is_ok(),
             "construction-time verification must defer module symbol lookup"
         );
 
@@ -692,7 +769,7 @@ mod tests {
             vec![],
         );
         assert!(
-            importer_construction_call.verify(&ctx).is_ok(),
+            verify_call(&ctx, &importer_construction_call).is_ok(),
             "a call inside an as-yet-uninserted importer function must remain detached"
         );
 
@@ -711,7 +788,7 @@ mod tests {
             .get_operation()
             .insert_at_back(top_level_block, &ctx);
         assert!(
-            attached_top_level.verify(&ctx).is_err(),
+            verify_call(&ctx, &attached_top_level).is_err(),
             "a call directly in a final module must not claim detached-construction deferral"
         );
 
@@ -736,7 +813,7 @@ mod tests {
             vec![raw_mut],
         );
         assert!(
-            unresolved.verify(&ctx).is_err(),
+            verify_call(&ctx, &unresolved).is_err(),
             "an attached unresolved call must not pass merely because its pointer bits lower"
         );
 
@@ -748,7 +825,7 @@ mod tests {
             vec![raw_mut],
         );
         exact.set_external_callee_signature(&mut ctx, signature);
-        assert!(exact.verify(&ctx).is_ok());
+        assert!(verify_call(&ctx, &exact).is_ok());
 
         let wrong_argument = append_call(
             &mut ctx,
@@ -759,7 +836,7 @@ mod tests {
         );
         wrong_argument.set_external_callee_signature(&mut ctx, signature);
         assert!(
-            wrong_argument.verify(&ctx).is_err(),
+            verify_call(&ctx, &wrong_argument).is_err(),
             "AbiBoundary must not turn UniqueRef into the declared RawMut argument"
         );
 
@@ -772,7 +849,7 @@ mod tests {
         );
         wrong_result.set_external_callee_signature(&mut ctx, signature);
         assert!(
-            wrong_result.verify(&ctx).is_err(),
+            verify_call(&ctx, &wrong_result).is_err(),
             "AbiBoundary must not turn the declared RawMut result into UniqueRef"
         );
 
@@ -785,7 +862,7 @@ mod tests {
         );
         unpaired_signature.set_attr_external_callee_type(&ctx, TypeAttr::new(signature));
         assert!(
-            unpaired_signature.verify(&ctx).is_err(),
+            verify_call(&ctx, &unpaired_signature).is_err(),
             "a signature without the explicit ABI authority is incomplete"
         );
 
@@ -800,7 +877,7 @@ mod tests {
         wrong_authority
             .set_attr_call_pointer_kind_authority(&ctx, MirPointerKindAuthorityAttr::Reborrow);
         assert!(
-            wrong_authority.verify(&ctx).is_err(),
+            verify_call(&ctx, &wrong_authority).is_err(),
             "a non-ABI pointer authority must not bless an external signature"
         );
 
@@ -821,7 +898,7 @@ mod tests {
         );
         falsely_external.set_external_callee_signature(&mut ctx, signature);
         assert!(
-            falsely_external.verify(&ctx).is_err(),
+            verify_call(&ctx, &falsely_external).is_err(),
             "an in-module Rust callee must be typed only by its mir.func"
         );
     }
@@ -858,7 +935,7 @@ mod tests {
             vec![condition, raw, raw],
             vec![raw_mut],
         );
-        assert!(exact.verify(&ctx).is_ok());
+        assert!(verify_call(&ctx, &exact).is_ok());
 
         let invented_result = append_call(
             &mut ctx,
@@ -868,7 +945,7 @@ mod tests {
             vec![unique_ref],
         );
         assert!(
-            invented_result.verify(&ctx).is_err(),
+            verify_call(&ctx, &invented_result).is_err(),
             "select must not launder RawMut operands into a UniqueRef result"
         );
 
@@ -880,7 +957,7 @@ mod tests {
             vec![raw_mut],
         );
         assert!(
-            mixed_branches.verify(&ctx).is_err(),
+            verify_call(&ctx, &mixed_branches).is_err(),
             "both select alternatives must carry the same exact Rust type"
         );
 
@@ -903,7 +980,7 @@ mod tests {
             vec![nested_unique],
         );
         assert!(
-            nested_mismatch.verify(&ctx).is_err(),
+            verify_call(&ctx, &nested_mismatch).is_err(),
             "exact equality must recurse through aggregate pointer carriers"
         );
     }
@@ -915,7 +992,7 @@ mod tests {
 
         let unknown = new_call(&mut ctx, "__cuda_oxide_rust_intrinsic_typo", vec![], vec![]);
         assert!(
-            unknown.verify(&ctx).is_err(),
+            verify_call(&ctx, &unknown).is_err(),
             "the reserved namespace must use an exact allow-list even while detached"
         );
 
@@ -936,7 +1013,7 @@ mod tests {
             vec![pointer],
         );
         assert!(
-            numeric.verify(&ctx).is_err(),
+            verify_call(&ctx, &numeric).is_err(),
             "numeric placeholders cannot serve as an untyped pointer escape hatch"
         );
     }
